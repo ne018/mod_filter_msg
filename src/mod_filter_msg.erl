@@ -9,6 +9,8 @@
     init/2,
     stop/1,
     on_filter_packet/1,
+    user_receive_packet/1,
+    user_send_packet/1,
     now_z/0,
     get_timestamp/0
   ]
@@ -25,7 +27,6 @@
 -include("mod_muc_room.hrl").
 
 start(Host, Opts) ->
-
     register(?PROCNAME,spawn(?MODULE, init, [Host, Opts])),
     ok.
 
@@ -33,26 +34,165 @@ start(Host, Opts) ->
 init(Host, _Opts) ->
     inets:start(),
     ssl:start(),
-    ejabberd_hooks:add(filter_packet, global, ?MODULE, on_filter_packet, 0),
+    %ejabberd_hooks:add(filter_packet, global, ?MODULE, on_filter_packet, 0),
+    ejabberd_hooks:add(user_receive_packet, Host, ?MODULE, user_receive_packet, 88),
+    ejabberd_hooks:add(user_send_packet, Host, ?MODULE, user_send_packet, 88),
     ok.
 
 stop(Host) ->
-    ejabberd_hooks:delete(filter_packet, global, ?MODULE, on_filter_packet, 0),
+    %ejabberd_hooks:delete(filter_packet, global, ?MODULE, on_filter_packet, 0),
+    ejabberd_hooks:delete(user_receive_packet, Host, ?MODULE, user_receive_packet, 88),
+    ejabberd_hooks:delete(user_send_packet, Host, ?MODULE, user_send_packet, 88),
     ok.
 
+  
 
-fetchmsgs(MsgId, MsgTo, MsgFrom, MsgBody, MsgResource, MsgType, MsgTS, ExtraParams) ->
-	MsgFromWithResource = MsgFrom ++ "/" ++ MsgResource,
+
+user_send_packet({#message{to = Peer} = Pkt, #{jid := JID} = C2SState}) ->
+    %LUser = JID#jid.luser,
+    %LServer = JID#jid.lserver,
+    ?INFO_MSG("UserSendPacket To: ~p Pkt: ~p", [Peer, Pkt]),
+
+    %% filtering start here
+    if
+    	(tuple_size(Pkt) == 11) ->
+
+     		MessageType = Pkt#message.type,
+     		if (MessageType /= error) ->
+			packet_checking(Pkt),
+			ok;
+			true ->
+			ok
+		end,
+    ok;
+    true ->
+    ok
+    end,
+
+    %% filtering ends here
+    {Pkt, C2SState};
+user_send_packet(Acc) ->
+    Acc.
+
+
+user_receive_packet({#message{from = Peer} = Pkt, #{jid := JID} = C2SState}) ->
+    LUser = JID#jid.luser,
+    LServer = JID#jid.lserver,
+
+    %% filtering start here
+    if
+    	(tuple_size(Pkt) == 11) ->
+
+     		MessageType = Pkt#message.type,
+
+     		if
+     		  (MessageType == normal) ->
+			  		EventBody = hd(element(10, Pkt)),
+			  		if
+			  		  (tuple_size(EventBody) == 7) ->
+			  		      {PSEVNT,ItemHolder,_,_,_,_,_} = EventBody,
+			  			  {_,_,_,GetMainItem,_,_,_} = ItemHolder,
+			  			  [{PSITEM,_,_,MainItem,_,_}] = GetMainItem,
+			  			  ?INFO_MSG("UserReceivePacket INSIDE 7 Pkt: ~p", [hd(MainItem)]),
+			  			  packet_checking(hd(MainItem)),
+			  		   ok;
+			  		  (tuple_size(EventBody) == 5) ->
+			  		      {_,_,_,_,ItemHolder} = EventBody,
+			  			  [{_,_,MainItem}] = ItemHolder,
+
+			  			  ?INFO_MSG("UserReceivePacket INSIDE 5 Pkt: ~p", [hd(MainItem)]),
+			  			  packet_checking(hd(MainItem)),
+			  		   ok;
+			  		   true ->
+			  		   	?INFO_MSG("UserReceivePacket tuplesize not 7 or 5: ~p Ilan: ~p~n Pkt: ~p", [Peer, tuple_size(EventBody), Pkt]),
+					   ok
+				    end,
+				ok;
+			  (MessageType /= error) ->
+			      	packet_checking(Pkt),
+				ok;
+			    true ->
+			    ok
+		    end,
+    ok;
+    true ->
+    ok
+    end,
+
+    %% filtering ends here
+    
+    {Pkt, C2SState};
+user_receive_packet(Acc) ->
+    Acc.
+
+
+packet_checking(Pkt) ->
+	MessageType = Pkt#message.type,
+	MessageId = Pkt#message.id,
+	TimeStamp = now_to_microseconds(erlang:now()),
+	BodySection = element(8,Pkt),
+	MessageLang = Pkt#message.lang,
+
+	if
+	(length(BodySection) == 1) ->
+			From = element(5,Pkt),
+			To = element(6,Pkt),
+
+			if
+			(is_tuple(To)) ->
+					FromString = ctl(From#jid.luser) ++ "@" ++ ctl(From#jid.lserver),
+					ToString = ctl(To#jid.luser) ++ "@" ++ ctl(To#jid.lserver),
+					ServerHost = From#jid.lserver,
+					FromResource = ctl(From#jid.resource),
+
+					Data10 = element(10,Pkt),
+
+			    	if
+			    	  (MessageType == groupchat) ->
+					[{_,_,TupleBodyMsg}] = BodySection,
+					?INFO_MSG("ORIG Message GC Body: ~p , To: ~p From: ~p", [TupleBodyMsg, ToString, FromString]),
+
+					ExtraParamsToListGet = extraParamsToList(Data10),
+					ExtraParamsToJsonGet = jsone:encode(ExtraParamsToListGet),
+
+					fetchmsgs(MessageId, ToString, FromString, TupleBodyMsg, FromResource, MessageType, TimeStamp, "ExtraParamsToJsonGet", "receivepacket"),
+
+			    	  ok;
+			    	  (MessageType == chat) ->
+			    	    	[{_,_,TupleBodyMsg}] = BodySection,
+			    	    	?INFO_MSG("ORIG Message 1-1 Body: ~p , To: ~p From: ~p", [TupleBodyMsg, ToString, FromString]),
+
+				    	ExtraParamsToListGet = extraParamsToList(Data10),
+					ExtraParamsToJsonGet = jsone:encode(ExtraParamsToListGet),
+
+					fetchmsgs(MessageId, ToString, FromString, TupleBodyMsg, FromResource, MessageType, TimeStamp, "ExtraParamsToJsonGet", "receivepacket"),
+			    	  ok;
+			    	  true ->
+			    	  ok
+			    	end,
+			ok;
+			true->
+			ok
+			end,
+		ok;
+		true ->
+			%%?INFO_MSG("length of bodysection not equal to 1 probably ~p~n and the user is composing...", [length(BodySection)]),
+    	ok
+	end.
+
+
+fetchmsgs(MsgId, MsgTo, MsgFrom, MsgBody, MsgResource, MsgType, MsgTS, ExtraParams, MethodMsg) ->
 
 	JsonListBody = [
 		{<<"msgId">>, valueToBinary(MsgId)},
 		{<<"msgTo">>, valueToBinary(MsgTo)},
-		{<<"msgFrom">>, valueToBinary(MsgFromWithResource)},
+		{<<"msgFrom">>, valueToBinary(MsgFrom)},
 		{<<"msgBody">>, valueToBinary(MsgBody)},
 		{<<"msgType">>, valueToBinary(MsgType)},
 		{<<"msgResource">>, valueToBinary(MsgResource)},
 		{<<"msgTimestamp">>, valueToBinary(MsgTS)},
-		{<<"extraParams">>, ExtraParams}
+		{<<"extraParams">>, valueToBinary(ExtraParams)},
+		{<<"msgMethod">>, valueToBinary(MethodMsg)}
 	],
   
   	JsonBody = jsone:encode(JsonListBody),
@@ -68,7 +208,7 @@ ok.
 
 now_to_microseconds({Mega, Sec, Micro}) ->
     %%Epoch time in milliseconds from 1 Jan 1970
-    ?INFO_MSG("now_to_milliseconds Mega ~p Sec ~p Micro ~p~n", [Mega, Sec, Micro]),
+    %%?INFO_MSG("now_to_milliseconds Mega ~p Sec ~p Micro ~p~n", [Mega, Sec, Micro]),
     (Mega*1000000 + Sec)*1000000 + Micro.
 
 
@@ -164,38 +304,46 @@ on_filter_packet(Stanza) when (element(1, Stanza) == message) ->
 		BodySection = element(8,Stanza),
 		MessageLang = Stanza#message.lang,
 
-		From = element(5,Stanza),
-		To = element(6,Stanza),
+		if
+		    (length(BodySection) == 1) ->
+				From = element(5,Stanza),
+				To = element(6,Stanza),
 
-		FromString = ctl(From#jid.luser) ++ "@" ++ ctl(From#jid.lserver),
-		ToString = ctl(To#jid.luser) ++ "@" ++ ctl(To#jid.lserver),
-		ServerHost = From#jid.lserver,
-		FromResource = ctl(From#jid.resource),
+				FromString = ctl(From#jid.luser) ++ "@" ++ ctl(From#jid.lserver),
+				ToString = ctl(To#jid.luser) ++ "@" ++ ctl(To#jid.lserver),
+				ServerHost = From#jid.lserver,
+				FromResource = ctl(From#jid.resource),
 
-		Data10 = element(10,Stanza),
+				Data10 = element(10,Stanza),
 
-    	if
-    	  (MessageType == groupchat) ->
-			[{_,_,TupleBodyMsg}] = BodySection,
+		    	if
+		    	  (MessageType == groupchat) ->
+					[{_,_,TupleBodyMsg}] = BodySection,
+					?INFO_MSG("Message Body: ~p , To: ~p From: ~p", [TupleBodyMsg, ToString, FromString]),
 
-			ExtraParamsToListGet = extraParamsToList(Data10),
-			ExtraParamsToJsonGet = jsone:encode(ExtraParamsToListGet),
+					ExtraParamsToListGet = extraParamsToList(Data10),
+					ExtraParamsToJsonGet = jsone:encode(ExtraParamsToListGet),
 
-			fetchmsgs(MessageId, ToString, FromString, TupleBodyMsg, FromResource, MessageType, TimeStamp, ExtraParamsToJsonGet),
+					fetchmsgs(MessageId, ToString, FromString, TupleBodyMsg, FromResource, MessageType, TimeStamp, ExtraParamsToJsonGet, "ofp"),
 
-    	  ok;
-    	  (MessageType == chat) ->
-    	    [{_,_,TupleBodyMsg}] = BodySection,
+		    	  ok;
+		    	  (MessageType == chat) ->
+		    	    [{_,_,TupleBodyMsg}] = BodySection,
+		    	    ?INFO_MSG("Message Body: ~p , To: ~p From: ~p", [TupleBodyMsg, ToString, FromString]),
 
-    	    ExtraParamsToListGet = extraParamsToList(Data10),
-			ExtraParamsToJsonGet = jsone:encode(ExtraParamsToListGet),
+		    	    ExtraParamsToListGet = extraParamsToList(Data10),
+					ExtraParamsToJsonGet = jsone:encode(ExtraParamsToListGet),
 
-			fetchmsgs(MessageId, ToString, FromString, TupleBodyMsg, FromResource, MessageType, TimeStamp, ExtraParamsToJsonGet),
-    	  ok;
-    	  true ->
-    	  ok
+					fetchmsgs(MessageId, ToString, FromString, TupleBodyMsg, FromResource, MessageType, TimeStamp, ExtraParamsToJsonGet, "ofp"),
+		    	  ok;
+		    	  true ->
+		    	  ok
+		    	end,
+			ok;
+			true ->
+				%%?INFO_MSG("length of bodysection not equal to 1 probably ~p~n and the user is composing...", [length(BodySection)]),
+	    	ok
     	end,
-	
 	ok;
     true ->
     ok
@@ -205,6 +353,7 @@ Stanza;
 
 on_filter_packet(Stanza) ->
 Stanza.
+
 
 
 sendHttpRequest(Method, Request, HTTPOptions, Options)->
@@ -237,6 +386,5 @@ valueToBinary(P) when is_tuple(P)->
 	valueToBinary(X);
 valueToBinary(P) when true->
 	P.
-
 
 
